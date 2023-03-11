@@ -1,7 +1,11 @@
+import std.algorithm.iteration;
 import std.algorithm.searching;
+import std.array;
+import std.ascii;
 import std.conv;
 import std.digest;
 import std.digest.sha;
+import std.random;
 import std.range;
 import std.stdio;
 import std.string;
@@ -25,45 +29,172 @@ struct DBConnection
         NOT_IMPLEMENTED
     }
 
-    MongoClient client ;
-    MongoCollection users;
-    MongoCollection files;
-    MongoCollection urls;
-    
     this(string dbUser, string dbPassword, string dbAddr, string dbPort, string dbName)
     {
-        client = connectMongoDB("mongodb://" ~ dbUser ~ ":" ~ dbPassword ~ "@" ~ dbAddr ~ ":" ~ dbPort ~ "/");
-        users = client.getCollection(dbName ~ ".users");
-        files= client.getCollection(dbName ~ ".files");
-        urls= client.getCollection(dbName ~ ".urls");
+        this.client = connectMongoDB("mongodb://" ~ dbUser ~ ":" ~ dbPassword ~ "@" ~ dbAddr ~ ":" ~ dbPort);
+        this.dbName = dbName;
+    }
+
+    // Optional helper
+    static bool isValidEmail(string email)
+    {
+        if (email.empty)
+        {
+            return false;
+        }
+
+        auto res = email.find("@");
+        // Check that we have some text before @
+        // Check that @ is followed . and at least 2 chars after .
+        immutable int min_suffix_len = 2;
+        if (!res.empty && (email.length != res.length) && (res.find(".").length > min_suffix_len))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    unittest
+    {
+        assert(isValidEmail("a@gmail.co"));
+        assert(!isValidEmail("@gmail.co"));
+        assert(!isValidEmail("a@gmail.o"));
+        assert(!isValidEmail("a@gmailo"));
+        assert(!isValidEmail("agmailo"));
     }
 
     UserRet addUser(string email, string username, string password, string name = "", string desc = "")
     {
-        if(password==null)
+        if (password.length == 0)
+        {
             return UserRet.ERR_NULL_PASS;
-        if(email.indexOf('@')==-1)
+        }
+
+        if (!isValidEmail(email))
+        {
             return UserRet.ERR_INVALID_EMAIL;
-        if(users.findOne(["user":username])!=Bson(null))
+        }
+
+        string collectionName = "users";
+        MongoCollection users = client.getCollection(dbName ~ "." ~ collectionName);
+
+        auto res = users.findOne(["_id": email]);
+        if (res != Bson(null))
+        {
             return UserRet.ERR_USER_EXISTS;
-        users.insert(["email": email, "user":username, "pass": password]);
+        }
+        auto parola=toPassword(password.dup);
+        auto parola2=makeHash(toPassword(password.dup)).toString();
+        users.insert(["_id": email,
+                      "username": username,
+                      "password": parola2,
+                      "name": name,
+                      "desc": desc]);
+
+        // Query the database so that the above insertion propagates its effect.
+        users.findOne(["_id": email]);
+
         return UserRet.OK;
+    }
+
+    auto getUserData(string email)
+    {
+        if (!isValidEmail(email))
+        {
+            return Bson(null);
+        }
+
+        string collectionName = "users";
+        MongoCollection users = client.getCollection(dbName ~ "." ~ collectionName);
+
+        return users.findOne(["_id": email]);
+    }
+
+    string generateUserAccessToken(string email)
+    {
+        string collectionName = "users";
+        MongoCollection users = client.getCollection(dbName ~ "." ~ collectionName);
+
+        auto user = users.findOne(["_id": email]);
+        if (user == Bson(null))
+        {
+            // Return empty string if user does not exist
+            return "";
+        }
+
+        string token;
+        if (user.tryIndex("accessToken").isNull)
+        {
+            enum defaultPasswordChars = cast(immutable(ubyte)[]) (std.ascii.letters ~ std.ascii.digits);
+            token = digest!SHA512(defaultPasswordChars.randomCover).toHexString().to!string();
+            user["accessToken"] = token;
+            users.update(["_id": email], user);
+        }
+        else
+        {
+            token = user["accessToken"].to!string.strip("\"");
+        }
+        return token;
+    }
+
+    string getUserAccessToken(string email)
+    {
+        string collectionName = "users";
+        MongoCollection users = client.getCollection(dbName ~ "." ~ collectionName);
+
+        auto user = users.findOne(["_id": email]);
+
+        string token;
+        if ((user != Bson(null)) && (!user.tryIndex("accessToken").isNull))
+        {
+            token = user["accessToken"].to!string.strip("\"");
+        }
+        return token;
     }
 
     UserRet authUser(string email, string password)
     {
-        if(password==null)
+        if (password.length == 0)
+        {
             return UserRet.ERR_NULL_PASS;
-        if(email.indexOf('@')==-1)
+        }
+
+        if (!isValidEmail(email))
+        {
             return UserRet.ERR_INVALID_EMAIL;
-        if(users.findOne(["email":email])!=Bson(null)&&users.findOne(["pass":password])==Bson(null))
+        }
+
+        string collectionName = "users";
+        MongoCollection users = client.getCollection(dbName ~ "." ~ collectionName);
+
+        auto res = users.findOne(["_id": email]);
+        if (res == Bson(null))
+        {
+            return UserRet.ERR_WRONG_USER;
+        }
+
+        auto jump= parseHash(res["password"].toString().strip("\"")).salt;
+        auto parola=toPassword(password.dup);
+        auto parola2=makeHash(parola,jump).toString();
+        // TODO: Verify the given password against the hashed password.
+        if (res["password"].toString().strip("\"") != parola2)
+        {
             return UserRet.ERR_WRONG_PASS;
+        }
+
         return UserRet.OK;
     }
 
     UserRet deleteUser(string email)
     {
-        users.remove(["email":email]);
+        if (!isValidEmail(email))
+        {
+            return UserRet.ERR_INVALID_EMAIL;
+        }
+        string collectionName = "users";
+        MongoCollection users = client.getCollection(dbName ~ "." ~ collectionName);
+
+        users.remove(["_id": email]);
         return UserRet.OK;
     }
 
@@ -87,47 +218,62 @@ struct DBConnection
 
     FileRet addFile(string userId, immutable ubyte[] binData, string fileName)
     {
-        if(binData==null)
+        if (binData.empty)
+        {
             return FileRet.ERR_EMPTY_FILE;
-        auto rez=files.findOne(["binData":digest!SHA512(binData).toHexString().to!string]);
-        if(rez!=Bson(null))
+        }
+
+        string collectionName = "files";
+        MongoCollection files = client.getCollection(dbName ~ "." ~ collectionName);
+
+        File file;
+        file.id = BsonObjectID.generate();
+        file.userId = userId;
+        file.binData ~= binData;
+        file.fileName = fileName;
+        file.digest ~= digest!SHA512(file.binData).toHexString();
+
+        Nullable!File fileExists = files.findOne!File(["digest": file.digest]);
+        if (!fileExists.isNull)
+        {
             return FileRet.FILE_EXISTS;
-        files.insert(["usersID":userId, "binData":digest!SHA512(binData).toHexString().to!string, "fileName":fileName]);
+        }
+
+        files.insert(file);
         return FileRet.OK;
     }
 
     File[] getFiles(string userId)
     {
-        auto rez=files.find(["usersID" : userId]);
-        File[] file;
-        if(!rez.empty){
-            foreach (i; rez)
-            {
-                file[file.length++].digest = cast(string)(i["binData"]);
-            }
+        string collectionName = "files";
+        MongoCollection files = client.getCollection(dbName ~ "." ~ collectionName);
+
+        File[] userFiles;
+        foreach(file; files.find!File(["userId": userId]))
+        {
+            userFiles ~= file;
         }
-        return file;
+        return userFiles;
     }
 
     Nullable!File getFile(string digest)
     in(!digest.empty)
     do
     {
-        Nullable!File file;
-        File fil;
-        auto result=files.findOne(["binData":digest]);
-        if(!result.isNull){
-            fil.digest=cast(string)result["binData"];
-            file=Nullable!File(fil);
-        }
+        string collectionName = "files";
+        MongoCollection files = client.getCollection(dbName ~ "." ~ collectionName);
+
+        Nullable!File file = files.findOne!File(["digest": digest]);
         return file;
     }
 
-    void deleteFile(string digest)
+    void deleteFile(string email, string digest)
     in(!digest.empty)
     do
     {
-        files.remove(["binData":digest]);
+        string collectionName = "files";
+        MongoCollection files = client.getCollection(dbName ~ "." ~ collectionName);
+        files.remove(["userId": email, "digest": digest]);
     }
 
     struct Url
@@ -149,47 +295,63 @@ struct DBConnection
 
     UrlRet addUrl(string userId, string urlAddress)
     {
-        if(urlAddress==null){
+        if (urlAddress.empty)
+        {
             return UrlRet.ERR_EMPTY_URL;
         }
-        if(urls.findOne(["urlAddress": urlAddress])!=Bson(null))
+
+        string collectionName = "urls";
+        MongoCollection urls = client.getCollection(dbName ~ "." ~ collectionName);
+
+        Nullable!Url urlExists = urls.findOne!Url(["addr": urlAddress]);
+        if (!urlExists.isNull)
+        {
             return UrlRet.URL_EXISTS;
-        urls.insert(["userId":userId,"urlAddress": urlAddress]);
+        }
+
+        Url url;
+        url.id = BsonObjectID.generate();
+        url.userId = userId;
+        url.addr = urlAddress;
+
+        urls.insert(url);
         return UrlRet.OK;
     }
 
     Url[] getUrls(string userId)
     {
-        Url[] url;
-        auto rez=urls.find(["userId":userId]);
-        if(!rez.empty){
-            foreach (i; rez)
-            {
-                url.length++;
-                url[url.length-1].addr=cast(string)(i["urlAddress"]);
-            }
+        string collectionName = "urls";
+        MongoCollection urls = client.getCollection(dbName ~ "." ~ collectionName);
+
+        Url[] userUrls;
+        foreach(url; urls.find!Url(["userId": userId]))
+        {
+            userUrls ~= url;
         }
-        return url;
+        return userUrls;
     }
 
     Nullable!Url getUrl(string urlAddress)
     in(!urlAddress.empty)
     do
     {
-        Nullable!Url url;
-        Url ur;
-        auto result=urls.findOne(["urlAddress":urlAddress]);
-        if(!result.isNull){
-            ur.addr=cast(string)(result["urlAddress"]);
-            url=Nullable!Url(ur);
-        }
+        string collectionName = "urls";
+        MongoCollection urls = client.getCollection(dbName ~ "." ~ collectionName);
+
+        Nullable!Url url = urls.findOne!Url(["addr": urlAddress]);
         return url;
     }
 
-    void deleteUrl(string urlAddress)
+    void deleteUrl(string email, string urlAddress)
     in(!urlAddress.empty)
     do
     {
-        urls.remove(["urlAddress": urlAddress]);
+        string collectionName = "urls";
+        MongoCollection urls = client.getCollection(dbName ~ "." ~ collectionName);
+        urls.remove(["userId": email, "addr": urlAddress]);
     }
+
+private:
+    MongoClient client;
+    string dbName;
 }
